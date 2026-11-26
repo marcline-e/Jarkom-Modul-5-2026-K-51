@@ -1180,3 +1180,151 @@ iptables -I INPUT 2 -s 10.89.4.51 -p tcp -m multiport --dports 22,23,3306 -j REJ
   ![Soal 16 - Uji Port dari Dummy-Plug](resources/soal-16/soal16_uji_dummy_plug.png)
 * **Counter Paket Aturan `LOG ("SCAN-NERV: ")` dan `REJECT` di `Tokyo3-Core` (`iptables -L INPUT -v -n`)**
   ![Soal 16 - Counter Firewall Tokyo3-Core](resources/soal-16/soal16_counter_tokyo3.png)
+
+---
+
+## Soal 17 — Sihir Hitam di Jalur Paket (Pengalihan Transparan di `Fuyutsuki`)
+
+### Alur Pengerjaan
+1. Menyalakan *listener* Netcat pada port **TCP 9000** di **Zeruel (`10.89.4.82`)** (mencatat ke `/root/zeruel_9000.log`) dan **Pen-Pen (`10.89.3.195`)** (mencatat ke `/root/penpen_9000.log`).
+2. Membuat dan mengeksekusi skrip `/root/fuyutsuki_nat.sh` pada router **Fuyutsuki** untuk membelokkan setiap koneksi **TCP** dari **Magi-Casper (`10.89.4.58`)** menuju **Zeruel (`10.89.4.82`)** agar diarahkan diam-diam ke **Pen-Pen (`10.89.3.195`)**:
+   * **`PREROUTING` (`DNAT`):** Mengubah IP tujuan paket TCP dari `10.89.4.82` menjadi `10.89.3.195`. Karena filter hanya berlaku untuk `-p tcp`, paket ICMP (`ping`) dari Casper ke Zeruel tetap diteruskan ke Zeruel secara normal.
+   * **`POSTROUTING` (`MASQUERADE`):** Memastikan paket balasan dari `Pen-Pen` kembali melalui `Fuyutsuki` sehingga modul *connection tracking* (`conntrack`) menyamarkan IP sumber balasan agar tetap terlihat berasal dari `10.89.4.82` (`Zeruel`).
+3. Mengirimkan pesan dari **Magi-Casper** ke alamat IP **Zeruel (`10.89.4.82`)** port `9000` menggunakan `nc`, memverifikasi pesan masuk di **Pen-Pen** (dan tidak masuk di **Zeruel**), serta menampilkan entri translasi pada `conntrack -L` di **Fuyutsuki**.
+
+### Isi Script (`/root/fuyutsuki_nat.sh`)
+```bash
+#!/bin/sh
+(command -v iptables >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq iptables conntrack)) 2>/dev/null
+
+# Hapus rule lama agar idempotent
+iptables -t nat -D PREROUTING -s 10.89.4.58 -d 10.89.4.82 -p tcp -j DNAT --to-destination 10.89.3.195 2>/dev/null
+iptables -t nat -D POSTROUTING -s 10.89.4.58 -d 10.89.3.195 -p tcp -j MASQUERADE 2>/dev/null
+
+# Belokkan seluruh koneksi TCP dari Magi-Casper (10.89.4.58) ke Zeruel (10.89.4.82) menuju Pen-Pen (10.89.3.195)
+iptables -t nat -A PREROUTING -s 10.89.4.58 -d 10.89.4.82 -p tcp -j DNAT --to-destination 10.89.3.195
+iptables -t nat -A POSTROUTING -s 10.89.4.58 -d 10.89.3.195 -p tcp -j MASQUERADE
+```
+
+### Bukti Screenshot
+* **Pesan dari Casper Muncul di `Pen-Pen` (`/root/penpen_9000.log`) dan Kosong di `Zeruel` (`/root/zeruel_9000.log`)**
+  ![Soal 17 - Log Pen-Pen vs Zeruel](resources/soal-17/soal17_log_penpen_zeruel.png)
+* **Tabel Connection Tracking (`conntrack -L`) di Router `Fuyutsuki`**
+  ![Soal 17 - Conntrack Fuyutsuki](resources/soal-17/soal17_conntrack_fuyutsuki.png)
+
+---
+
+## Soal 18 — Gerbang Monolith dan Radar (`Shigeru`)
+
+### Alur Pengerjaan
+1. Mengamankan **Zona Sensitif** (**Switch-Monolith** pada `eth1` dan **Switch-Radar** di bawah **Makoto** pada `eth2`) melalui skrip `/root/shigeru_fw.sh` pada router **Shigeru** dengan kebijakan *stateful firewall* (`POLICY FORWARD DROP`).
+2. Mengizinkan seluruh lalu lintas balasan dari koneksi yang sudah terbangun (`--ctstate ESTABLISHED,RELATED`) serta mengizinkan seluruh koneksi baru yang berasal dari dalam zona sensitif (`-i eth1` dan `-i eth2`) menuju jaringan mana pun.
+3. Memberikan satu pengecualian masuk dari sisi **Gendou (`-i eth0`)**, yaitu paket `ping` (`ICMP echo-request`) dari subnet **Terminal (`10.89.4.56/29`)**, dan memblokir seluruh trafik masuk lainnya berdasarkan arah datangnya (`-i eth0 -j DROP`) tanpa menuliskan daftar subnet luar satu per satu agar subnet baru otomatis ikut terblokir.
+4. Menguji konektivitas `ping`: **Magi-Casper** ke **Zeruel** berhasil, **Lilith** ke **Zeruel** gagal (`100% packet loss`), dan **Zeruel** ke **Lilith** berhasil.
+
+### Isi Script (`/root/shigeru_fw.sh`)
+```bash
+#!/bin/sh
+iptables -F FORWARD
+iptables -P FORWARD DROP
+
+# 1. Izinkan paket balasan dari koneksi yang sudah terbangun (stateful)
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# 2. Izinkan node di dalam zona sensitif (Switch-Monolith eth1 & Switch-Radar/Makoto eth2) memulai koneksi keluar
+iptables -A FORWARD -i eth1 -j ACCEPT
+iptables -A FORWARD -i eth2 -j ACCEPT
+
+# 3. Pengecualian masuk dari sisi Gendou (eth0): ping dari subnet Terminal (10.89.4.56/29)
+iptables -A FORWARD -i eth0 -s 10.89.4.56/29 -p icmp --icmp-type echo-request -j ACCEPT
+
+# 4. Blokir seluruh koneksi masuk lainnya dari sisi Gendou berdasarkan arah interface (-i eth0)
+iptables -A FORWARD -i eth0 -j DROP
+```
+
+### Bukti Screenshot
+* **Aturan Firewall di Router `Shigeru` (`iptables -S FORWARD`)**
+  ![Soal 18 - Firewall Shigeru](resources/soal-18/soal18_firewall_shigeru.png)
+* **Ping dari `Magi-Casper` (`10.89.4.58`) ke `Zeruel` (`10.89.4.82`) Berhasil**
+  ![Soal 18 - Ping Casper ke Zeruel](resources/soal-18/soal18_ping_casper_zeruel.png)
+* **Ping dari `Lilith` (`10.89.4.74`) ke `Zeruel` (`10.89.4.82`) Gagal & Ping `Zeruel` ke `Lilith` Berhasil**
+  ![Soal 18 - Ping Lilith dan Zeruel](resources/soal-18/soal18_ping_lilith_zeruel.png)
+
+---
+
+## Soal 19 — Hukuman untuk Sang Pengkhianat (Isolasi Total `Armisael`)
+
+### Alur Pengerjaan & Analisis Layer 2/Layer 3
+1. Karena **Armisael (`10.89.4.83`)** dan **Zeruel (`10.89.4.82`)** berada dalam satu subnet yang sama (**Switch-Monolith**, `10.89.4.80/29`), komunikasi antar keduanya berjalan langsung pada **Layer 2 (Ethernet switch)** tanpa melewati gateway **Shigeru**, sementara pemasangan aturan di dalam `Armisael` dilarang.
+2. Isolasi total dilakukan tanpa menyentuh konfigurasi di dalam `Armisael` melalui dua langkah:
+   * **Sisi Layer 2 (Switch/GNS3):** Memutus (*suspend/delete*) tautan link fisik antara **Armisael** dan **Switch-Monolith** pada topologi GNS3 sehingga komunikasi ke *gateway* (`10.89.4.81`) maupun tetangga satu switch (`Zeruel`, `10.89.4.82`) terputus sepenuhnya tanpa menyeret `Zeruel`.
+   * **Sisi Layer 3 (Gateway `Shigeru`):** Menambahkan aturan pemblokiran IP `10.89.4.83` pada rantai `INPUT` dan `FORWARD` di router **Shigeru**.
+3. Menyalakan *listener* **TCP 9000** di **Armisael**, **Zeruel**, dan **Lilith**, lalu membuktikan seluruh koneksi `ping` dan `nc` dari **Armisael** menuju **Shigeru**, **Zeruel**, **Lilith**, dan **Seele (`8.8.8.8:53`)** gagal total, sedangkan **Zeruel** tetap berhasil berkomunikasi penuh dengan **Lilith** dan **Seele**.
+
+### Tambahan Aturan Pemblokiran pada `/root/shigeru_fw.sh`
+```bash
+# Isolasi total IP Armisael (10.89.4.83) pada sisi gateway Shigeru
+iptables -D INPUT -s 10.89.4.83 -j DROP 2>/dev/null
+iptables -D FORWARD -s 10.89.4.83 -j DROP 2>/dev/null
+iptables -D FORWARD -d 10.89.4.83 -j DROP 2>/dev/null
+
+iptables -I INPUT 1 -s 10.89.4.83 -j DROP
+iptables -I FORWARD 1 -s 10.89.4.83 -j DROP
+iptables -I FORWARD 2 -d 10.89.4.83 -j DROP
+```
+
+### Bukti Screenshot
+* **Pengujian `ping` dan `nc` dari `Armisael` ke Gateway, `Zeruel`, `Lilith`, dan `Seele` Gagal Total**
+  ![Soal 19 - Isolasi Armisael](resources/soal-19/soal19_isolasi_armisael.png)
+* **Pengujian `ping` dan `nc` dari `Zeruel` ke `Seele` (`8.8.8.8:53`) dan `Lilith` (`10.89.4.74:9000`) Tetap Berhasil**
+  ![Soal 19 - Zeruel Tetap Normal](resources/soal-19/soal19_zeruel_normal.png)
+* **Log Penerimaan Pesan dari `Zeruel` pada `Lilith` (`/root/lilith_9000.log`)**
+  ![Soal 19 - Log Lilith dari Zeruel](resources/soal-19/soal19_log_lilith.png)
+
+---
+
+## Soal 20 — Uji Kebakaran Geofront (Backup & Pemulihan Idempoten)
+
+### Alur Pengerjaan
+1. Memilih **3 node** yang mencakup router dan server layanan: **Fuyutsuki** (router NAT/routing), **Gendou** (router utama/firewall), dan **Tokyo3-Core** (server layanan & firewall port scan).
+2. Menyimpan seluruh aturan `iptables` aktif pada masing-masing node ke berkas `/root/<nama>.rules` menggunakan perintah `iptables-save`, serta menyiapkan skrip pemulihan rute statis yang bersifat **idempoten** menggunakan `ip route replace` (agar tidak menimbulkan duplikasi maupun error `RTNETLINK answers: File exists` saat dijalankan berulang kali).
+3. Menghapus seluruh aturan `iptables` (baik tabel `filter` maupun tabel `nat`) serta menghapus rute statis tambahan di ketiga node.
+4. Menjalankan pemulihan (`iptables-restore < /root/<nama>.rules` diikuti skrip rute) **dua kali berturut-turut** pada masing-masing node, memverifikasi bahwa jumlah baris output `iptables -S` dan `iptables -t nat -S` identik antara pemulihan pertama dan kedua, serta menguji fungsi jaringan masing-masing node kembali berjalan normal.
+
+### Script Pemulihan Rute Idempoten pada Ketiga Node
+
+#### 1. Router `Fuyutsuki` (`/root/fuyutsuki.sh`)
+```bash
+#!/bin/sh
+ip route replace default via 10.89.4.145 dev eth0
+ip route replace 10.89.3.192/27 via 10.89.4.126 dev eth2
+ip route replace 10.89.4.72/29 via 10.89.4.154 dev eth3
+```
+
+#### 2. Router `Gendou` (`/root/gendou_route.sh`)
+```bash
+#!/bin/sh
+# Memulihkan seluruh rute statis via gateway menggunakan ip route replace agar idempoten
+ip route show | grep ' via ' | awk '{print "ip route replace " $0}'
+```
+
+#### 3. Server `Tokyo3-Core` (`/root/tokyo3_route.sh`)
+```bash
+#!/bin/sh
+ip route replace default via 10.89.4.105 dev eth0
+```
+
+### Tabel Verifikasi Jumlah Baris Rule Setelah Pemulihan 1 & Pemulihan 2
+| Node | Peran | Baris `iptables -S` (Pemulihan 1) | Baris `iptables -S` (Pemulihan 2) | Baris `iptables -t nat -S` (Pemulihan 1) | Baris `iptables -t nat -S` (Pemulihan 2) | Status Fungsi |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| **Fuyutsuki** | Router | 3 | 3 | 6 | 6 | Normal (DNAT/MASQUERADE & rute aktif) |
+| **Gendou** | Router | 11 | 11 | 5 | 5 | Normal (NAT & firewall DROP aktif) |
+| **Tokyo3-Core** | Server | 5 | 5 | 4 | 4 | Normal (`SCAN-NERV:` & HTTP 80/8080 aktif) |
+
+### Bukti Screenshot
+* **Pemulihan 2x Berturut-turut pada Router `Fuyutsuki` (`iptables -S | wc -l`, `iptables -t nat -S | wc -l`, `ip route show`)**
+  ![Soal 20 - Pemulihan Fuyutsuki](resources/soal-20/soal20_pemulihan_fuyutsuki.png)
+* **Pemulihan 2x Berturut-turut pada Router `Gendou` & Uji Ping Internet**
+  ![Soal 20 - Pemulihan Gendou](resources/soal-20/soal20_pemulihan_gendou.png)
+* **Pemulihan 2x Berturut-turut pada `Tokyo3-Core` & Uji Koneksi dari `Dummy-Plug` (Port `22` Ditolak, Port `80` Berhasil)**
+  ![Soal 20 - Pemulihan Tokyo3-Core](resources/soal-20/soal20_pemulihan_tokyo3.png)
